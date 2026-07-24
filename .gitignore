@@ -1,0 +1,16 @@
+# 帳密明文,絕對不能進版本庫
+config.json
+
+# Chrome 登入 session(cookies),外流等於帳號被盜用
+browser-data/
+
+# 相依套件與打包產物
+node_modules/
+dist/
+
+# 除錯截圖(可能含個人資訊)
+*.png
+
+# 編輯器與系統檔
+.vscode/
+.DS_Store

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/jeffreychiu/puppeteer-auto-order remote -v)",
+      "Bash(git -C /Users/jeffreychiu/puppeteer-auto-order status --short)",
+      "Bash(awk '{print $2}')",
+      "Bash(git reset *)",
+      "Bash(git add *)"
+    ]
+  }
+}
