@@ -40,12 +40,22 @@ const CONFIG = {
   google: { email: '', password: '' },
   orderTime: '',
 
-  // 提前幾毫秒開始動作(補償頁面載入延遲)
-  earlyOffsetMs: 500,
+  // 提前幾毫秒開始動作:3000 = 公告三點整開賣,2:59:57(伺服器時間)就開始 reload
+  earlyOffsetMs: 3000,
 
-  // 登入完成後自動再開第二個視窗(共用同一個登入狀態),兩個視窗同時搶,
-  // 誰先看到「直接購買」誰先點;任一個成功,另一個自動收手
-  dualWindow: true,
+  // 總共開幾個視窗一起搶(1 = 單視窗)。全部共用同一個登入狀態,
+  // 誰先看到「直接購買」誰先點;任一個成功,其他自動收手。
+  // ⚠️ 安全上限測試中:2 可正常加入、6 會觸發 momo 保護(addGoods CORS)。
+  //    正在往上逼近,目前試 4。若被擋 → 退回上一個成功值再扣 1 當正式值。
+  windowCount: 4,
+
+  // 相鄰視窗的出發時間差:視窗 1 準時、視窗 2 晚 400ms、視窗 3 晚 800ms…
+  // 整點瞬間第一波請求常常全部塞死,錯開讓每 0.4 秒都有一個新請求出發,鋪滿時間軸
+  windowStaggerMs: 400,
+
+  // 開搶階段封鎖圖片/影音/字型/廣告追蹤(加快按鈕出現;HTML/CSS/JS 不擋)。
+  // 已排除是它造成 addGoods CORS(關掉/拔掉後照樣失敗),故保留加速用途。
+  blockHeavyResources: true,
 
   // 商品頁要點擊的按鈕文字(比對「包含」該文字的可見按鈕)
   buttons: {
@@ -54,9 +64,12 @@ const CONFIG = {
 
   // 「直接購買」的等待/重整策略(人潮多、頁面慢時避免誤判)
   buttonPoll: {
-    renderedWaitMs: 5000,  // 頁面「已完整載入」後,再多等這麼久仍沒按鈕 → 才重新整理
+    // 頁面「已完整載入」後,再多等這麼久仍沒按鈕 → 才重新整理。
+    // 不能太長:提前起跑會載到「還沒開賣」的頁面,等太久會剛好錯過開賣瞬間
+    renderedWaitMs: 1500,
     slowLoadMaxMs: 30000,  // 頁面一直載不完時,單次最多等這麼久才重新整理
     reloadDelayMs: 300,    // 每次重新整理之間的間隔
+    reloadJitterMs: 150,   // 間隔加上 ± 這麼多的隨機抖動:節奏太規律容易被當機器人
   },
 
   // 瀏覽器資料存放位置(每次啟動前會自動清空,確保全新登入)
@@ -209,6 +222,54 @@ async function loadOrAskConfig() {
 async function pauseBeforeExit() {
   await ask('\n(按 Enter 鍵結束程式)');
   process.exit(1);
+}
+
+/**
+ * 量測「momo 伺服器時鐘 − 本機時鐘」的偏移量(毫秒)。
+ * 開賣與否是看伺服器的錶,本機時鐘差個一兩秒就會早到或遲到。
+ *
+ * 原理:HTTP 回應的 Date 標頭就是伺服器時鐘,但精度只有 1 秒。
+ * 所以用 50ms 間隔連續請求 robots.txt(極小的檔案),
+ * 抓到 Date「秒數跳動」的那一刻 —— 跳動瞬間伺服器剛好跨過整秒,
+ * 可以把精度收斂到大約 ±(RTT/2 + 取樣間隔)。
+ * 量測失敗回傳 null(呼叫端改用本機時鐘)。
+ */
+async function measureServerTimeOffset() {
+  const url = CONFIG.homeUrl.replace(/\/+$/, '') + '/robots.txt';
+  const samples = [];
+  try {
+    for (let i = 0; i < 40; i++) {
+      const t0 = Date.now();
+      const res = await fetch(url, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(3000),
+      });
+      const t1 = Date.now();
+      await res.text(); // 讀完(檔案很小),讓連線可以重複使用
+      const serverSec = Date.parse(res.headers.get('date') || '');
+      if (Number.isNaN(serverSec)) continue;
+      samples.push({ mid: (t0 + t1) / 2, rtt: t1 - t0, serverSec });
+
+      // 已觀察到秒數跳動 → 資料足夠,提前收工
+      if (samples.length >= 2 && serverSec > samples[0].serverSec) break;
+      await sleep(50);
+    }
+  } catch {
+    /* 網路異常,往下看已收集的樣本夠不夠 */
+  }
+  if (samples.length === 0) return null;
+
+  // 找出秒數跳動的相鄰兩個樣本:伺服器在這兩個請求之間跨過整秒
+  for (let j = 1; j < samples.length; j++) {
+    if (samples[j].serverSec > samples[j - 1].serverSec) {
+      const boundaryLocal = (samples[j - 1].mid + samples[j].mid) / 2;
+      return Math.round(samples[j].serverSec - boundaryLocal);
+    }
+  }
+
+  // 沒等到跳動(網路太慢等原因)→ 用 RTT 最小的樣本粗估(精度 ±0.5 秒)
+  const best = samples.reduce((a, b) => (a.rtt <= b.rtt ? a : b));
+  return Math.round(best.serverSec + 500 - best.mid);
 }
 
 /**
@@ -651,6 +712,58 @@ async function doGoogleLogin(browser, page) {
   throw new Error('Google 登入流程逾時(90 秒),已截圖供診斷');
 }
 
+/**
+ * 開搶階段要封鎖的資源(URL 樣式)。原則:只擋「對按鈕出現毫無貢獻」的東西——
+ * 圖片/影音/字型/廣告追蹤;HTML、CSS、JS 一律不擋(按鈕的渲染與點擊靠它們)。
+ */
+const HEAVY_RESOURCE_PATTERNS = [
+  // 圖片
+  '*.jpg*', '*.jpeg*', '*.png*', '*.gif*', '*.webp*', '*.avif*', '*.ico*', '*.svg*',
+  // 影音
+  '*.mp4*', '*.webm*', '*.m3u8*', '*.mp3*',
+  // 字型
+  '*.woff*', '*.ttf*', '*.otf*',
+  // 常見廣告 / 追蹤
+  '*googletagmanager.com*', '*google-analytics.com*', '*doubleclick.net*',
+  '*connect.facebook.net*', '*facebook.com/tr*', '*criteo.com*',
+  '*hotjar.com*', '*clarity.ms*', '*scupio.com*',
+];
+
+/**
+ * 對單一頁面啟用重資源封鎖。
+ * 用 CDP 的 Network.setBlockedURLs:瀏覽器內部直接丟棄,不經過 Node,
+ * 每個請求零額外延遲(比 Puppeteer 的 request interception 快)。
+ * 回傳 CDP session —— 不能 detach,封鎖設定跟著 session 存活。
+ */
+async function blockHeavyResources(page) {
+  const cdp = await page.target().createCDPSession();
+  await cdp.send('Network.enable');
+  await cdp.send('Network.setBlockedURLs', { urls: HEAVY_RESOURCE_PATTERNS });
+  return cdp;
+}
+
+/**
+ * 多視窗搶購:視窗 1 準時出發,之後每個視窗依序晚 windowStaggerMs 出發,
+ * 把開賣前後的時間軸鋪滿——整點瞬間的第一波請求常常一起塞死,
+ * 錯開能保證總有一個視窗的 reload 剛好落在「門打開後」的窗口。
+ * Promise.any:任一視窗成功即結束;單一視窗出錯不會拖垮其他視窗。
+ */
+async function snipeMany(browser, pages) {
+  return Promise.any(
+    pages.map((p, i) =>
+      (async () => {
+        if (i > 0) {
+          await sleep(i * CONFIG.windowStaggerMs);
+          console.log(
+            `⏱️  [視窗${i + 1}] 晚 ${i * CONFIG.windowStaggerMs} ms 出發(錯開流量)`
+          );
+        }
+        return snipeBuy(browser, p, `[視窗${i + 1}] `);
+      })()
+    )
+  );
+}
+
 /** 清除所有 momo 網域的 cookies(處理「頁面看似登入、交易 session 卻失效」的狀況) */
 async function clearMomoCookies(page) {
   const client = await page.target().createCDPSession();
@@ -739,53 +852,86 @@ async function ensureLoggedIn(browser, page, { force = false } = {}) {
  * 用 evaluateOnNewDocument 註冊:之後每次 reload 都自動重新生效。
  * 只在「商品頁」作用(比對網址路徑),避免登入流程或結帳頁誤點。
  */
+/**
+ * (在頁面內執行)安裝「直接購買一出現就點」的 MutationObserver。
+ * 這個函式會被整段序列化後丟進瀏覽器執行,內容不可引用外部變數。
+ * targetPath 傳 '*' 表示不檢查網域/路徑(供本地測試使用)。
+ */
+function installBuyObserver(texts, targetPath) {
+  // 只在商品頁啟動(reload 後的每個新文件都會跑到這裡)
+  if (targetPath !== '*') {
+    if (!location.hostname.endsWith('momoshop.com.tw')) return;
+    if (targetPath && location.pathname !== targetPath) return;
+  }
+  if (window.__buyObserver) return; // 已經裝過(避免重複安裝、重複點擊)
+
+  const tryClick = () => {
+    if (window.__buyClickedAt) return true;
+    const candidates = document.querySelectorAll(
+      'button, a, [role="button"], input[type="button"], input[type="submit"]'
+    );
+    for (const t of texts) {
+      for (const n of candidates) {
+        const label = ((n.innerText || n.value || '') + '').replace(/\s+/g, '');
+        if (!label.includes(t) || n.disabled) continue;
+        const r = n.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        n.click();
+        window.__buyClickedAt = Date.now(); // 讓 Node 端知道已經點下去了
+        window.__buyObserver.disconnect();
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // DOM 每長出/改變任何東西就立刻檢查一次(涵蓋「轉圈圈轉到第 57 秒突然出現按鈕」)
+  window.__buyObserver = new MutationObserver(tryClick);
+  window.__buyObserver.observe(document, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['class', 'style', 'disabled', 'hidden'],
+  });
+  tryClick();
+}
+
+/** 下一次重整前的等待毫秒數:固定間隔 ± 隨機抖動(避免節奏規律得像機器人) */
+function nextReloadDelay() {
+  const { reloadDelayMs, reloadJitterMs } = CONFIG.buttonPoll;
+  return Math.max(
+    0,
+    Math.round(reloadDelayMs + (Math.random() * 2 - 1) * (reloadJitterMs || 0))
+  );
+}
+
+/** 商品頁的路徑(觀察器只在這個路徑作用) */
+function productPathname() {
+  try {
+    return new URL(CONFIG.productUrl).pathname;
+  } catch {
+    return '';
+  }
+}
+
 async function armInstantBuyClicker(page) {
   await page.evaluateOnNewDocument(
-    (texts, targetPath) => {
-      // 只在商品頁啟動(reload 後的每個新文件都會跑到這裡)
-      if (!location.hostname.endsWith('momoshop.com.tw')) return;
-      if (targetPath && location.pathname !== targetPath) return;
-
-      const tryClick = () => {
-        if (window.__buyClickedAt) return true;
-        const candidates = document.querySelectorAll(
-          'button, a, [role="button"], input[type="button"], input[type="submit"]'
-        );
-        for (const t of texts) {
-          for (const n of candidates) {
-            const label = ((n.innerText || n.value || '') + '').replace(/\s+/g, '');
-            if (!label.includes(t) || n.disabled) continue;
-            const r = n.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) continue;
-            n.click();
-            window.__buyClickedAt = Date.now(); // 讓 Node 端知道已經點下去了
-            if (window.__buyObserver) window.__buyObserver.disconnect();
-            return true;
-          }
-        }
-        return false;
-      };
-
-      // DOM 每長出/改變任何東西就立刻檢查一次(涵蓋「轉圈圈轉到第 57 秒突然出現按鈕」)
-      window.__buyObserver = new MutationObserver(tryClick);
-      window.__buyObserver.observe(document, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['class', 'style', 'disabled', 'hidden'],
-      });
-      tryClick();
-    },
+    installBuyObserver,
     CONFIG.buttons.buy,
-    (() => {
-      try {
-        return new URL(CONFIG.productUrl).pathname;
-      } catch {
-        return '';
-      }
-    })()
+    productPathname()
   );
   console.log('⚡ 已安裝「直接購買」瞬間點擊觀察器(按鈕一渲染出來就會立刻點下)');
+}
+
+/**
+ * 對「目前已載入的頁面」立即安裝觀察器(不等下一次 reload)。
+ * 用於倒數最後幾秒提前武裝:有些開賣是前端不重整、直接把按鈕變出來的,
+ * 提前裝好就能在按鈕出現的瞬間點到,連 reload 都不用等。
+ */
+async function armInstantBuyClickerNow(page, targetPath = productPathname()) {
+  await page
+    .evaluate(installBuyObserver, CONFIG.buttons.buy, targetPath)
+    .catch(() => {});
 }
 
 /** 單次嘗試:在目前頁面上找「直接購買」並點擊(立即回傳,不等待) */
@@ -849,30 +995,31 @@ async function waitAndClickBuy(page) {
 }
 
 /**
- * 開第二個「已登入」的瀏覽器視窗:同一個 Chrome、同一個 profile,
+ * 開一個額外的「已登入」瀏覽器視窗:同一個 Chrome、同一個 profile,
  * cookies 完全共用,所以開起來就是登入狀態,不用(也不能)再登入一次。
- * 網址加上無害的 __w=2 參數以便辨識(pathname 不變,瞬間點擊觀察器照常作用)。
+ * 用「開視窗前後 target 差集」辨識新視窗 —— 不動到網址(不加任何參數),
+ * 避免對 momo 頁面造成任何副作用(先前用 __w 參數,已移除)。
  */
 async function openSecondWindow(browser, url) {
-  const url2 = url + (url.includes('?') ? '&' : '?') + '__w=2';
   try {
+    const before = new Set(browser.targets());
     const cdp = await browser.target().createCDPSession();
-    const { targetId } = await cdp.send('Target.createTarget', {
-      url: url2,
+    await cdp.send('Target.createTarget', {
+      url, // 乾淨網址,不加任何參數
       newWindow: true, // 開成獨立視窗(不是分頁),避免背景分頁被 Chrome 降速
     });
     await cdp.detach().catch(() => {});
     const target = await browser.waitForTarget(
-      (t) => t.url().includes('__w=2'),
+      (t) => !before.has(t) && t.type() === 'page',
       { timeout: 15000 }
     );
     const p = await target.page();
     if (p) return p;
-    throw new Error(`拿不到新視窗的分頁物件(targetId: ${targetId})`);
+    throw new Error('拿不到新視窗的分頁物件');
   } catch (e) {
     console.log('⚠️  開獨立視窗失敗,改用新分頁代替:', e.message);
     const p = await browser.newPage();
-    await p.goto(url2, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await p.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
     return p;
   }
 }
@@ -885,6 +1032,28 @@ let reloginPromise = null;
 
 /** 搶購主迴圈:reload → 點「直接購買」→ 確認點擊生效,直到成功為止 */
 async function snipeBuy(browser, page, label = '') {
+  // 提前武裝的觀察器可能在倒數的最後幾秒就搶先點到(有些賣場會提早幾秒開賣):
+  // 先檢查目前頁面,若已點擊或已跳到購物車,直接收手,不要 reload 把狀態沖掉。
+  const earlyClicked = await page
+    .evaluate(
+      () =>
+        window.__buyClickedAt ||
+        /前往結帳|購物車明細/.test(document.body.innerText)
+    )
+    .catch(() => false);
+  if (earlyClicked) {
+    snipeDone = true;
+    console.log(`\n🎉 ${label}「直接購買」在開賣前的最後倒數就被瞬間點擊!(目前頁面:${page.url().slice(0, 100)})`);
+    console.log('   腳本到此收手,接下來請手動完成結帳。');
+    return true;
+  }
+
+  // 開搶階段才封鎖重資源:載入變快 → 按鈕更早被渲染 → 觀察器更早點到
+  if (CONFIG.blockHeavyResources) {
+    await blockHeavyResources(page).catch(() => {});
+    console.log(`🚫 ${label}已封鎖圖片/影音/字型/追蹤資源(加速按鈕出現)`);
+  }
+
   // 關鍵:先在頁面裡裝好「一出現就點」的觀察器,之後每次 reload 都自動生效
   await armInstantBuyClicker(page);
   for (let attempt = 1; ; attempt++) {
@@ -917,7 +1086,7 @@ async function snipeBuy(browser, page, label = '') {
     const clicked = await waitAndClickBuy(page);
     if (!clicked) {
       console.log('   「直接購買」尚未出現,重新整理再試...');
-      await sleep(CONFIG.buttonPoll.reloadDelayMs);
+      await sleep(nextReloadDelay());
       continue;
     }
     console.log('✅ 已點擊「直接購買」,確認是否生效...');
@@ -1063,28 +1232,45 @@ async function main() {
     // 步驟 3:前往商品頁停留,倒數等待下單時間
     await page.goto(CONFIG.productUrl, { waitUntil: 'domcontentloaded' });
 
-    // 步驟 3.5:登入就緒後,再開第二個視窗(共用登入狀態,不用重新登入)
-    let page2 = null;
-    if (CONFIG.dualWindow) {
-      console.log('\n🪟 登入就緒,開啟第二個視窗(共用同一個登入 session)...');
-      page2 = await openSecondWindow(browser, CONFIG.productUrl);
-      console.log('✅ 第二個視窗已開啟並停在商品頁,兩個視窗將同時搶購');
+    // 步驟 3.5:登入就緒後,再開額外視窗(共用同一個登入狀態,不用重新登入)
+    const pages = [page];
+    const extraWindows = Math.max(0, (CONFIG.windowCount || 1) - 1);
+    if (extraWindows > 0) {
+      console.log(`\n🪟 登入就緒,再開 ${extraWindows} 個視窗(共用同一個登入 session)...`);
+      for (let n = 2; n <= extraWindows + 1; n++) {
+        pages.push(await openSecondWindow(browser, CONFIG.productUrl));
+        console.log(`   ✅ 視窗 ${n} 已開啟`);
+      }
+      console.log(
+        `✅ 共 ${pages.length} 個視窗將一起搶購(依序錯開 ${CONFIG.windowStaggerMs} ms 出發)`
+      );
+    }
+
+    // 校準時鐘:開賣是看 momo 伺服器的錶,把倒數目標平移到伺服器時間
+    console.log('\n🕐 校準時鐘:量測 momo 伺服器與本機的時間差...');
+    const serverOffsetMs = await measureServerTimeOffset();
+    if (serverOffsetMs === null) {
+      console.log('⚠️  量測失敗,改用本機時鐘倒數(建議確認電腦已開啟自動校時)');
+    } else {
+      console.log(
+        `✅ momo 伺服器時鐘比本機${serverOffsetMs >= 0 ? '快' : '慢'} ${Math.abs(serverOffsetMs)} ms,已校正倒數目標`
+      );
     }
 
     console.log(`\n📅 已停在商品頁,預定下單時間:${CONFIG.orderTime}`);
-    await waitUntilEpoch(
-      new Date(CONFIG.orderTime).getTime() - CONFIG.earlyOffsetMs
-    );
+    // 伺服器比本機快 offset → 伺服器的 00:00 發生在本機的 (00:00 − offset)
+    const targetEpochMs =
+      new Date(CONFIG.orderTime).getTime() - (serverOffsetMs ?? 0);
+
+    // momo 的「直接購買」按鈕只在 reload 後才出現(前端不會自己把它變出來),
+    // 所以不提前武裝停留頁(那只會在測試現貨商品時誤觸),直接倒數到開搶時刻。
+    await waitUntilEpoch(targetEpochMs - CONFIG.earlyOffsetMs, targetEpochMs);
     console.log('\n⏰ 時間到!開始搶購!');
 
     // 步驟 4:reload → 點「直接購買」→ 成功後交還手動操作
-    // 雙視窗:兩個搶購迴圈同時跑,誰先點到誰贏;任一個成功另一個自動收手。
-    // Promise.any:一個視窗出錯(例如重登逾時)不會拖垮另一個。
-    if (page2) {
-      await Promise.any([
-        snipeBuy(browser, page, '[視窗1] '),
-        snipeBuy(browser, page2, '[視窗2] '),
-      ]);
+    // 多視窗:依序錯開出發鋪滿時間軸;任一個成功其他自動收手。
+    if (pages.length > 1) {
+      await snipeMany(browser, pages);
     } else {
       await snipeBuy(browser, page);
     }
@@ -1096,7 +1282,21 @@ async function main() {
   console.log('\n(瀏覽器保持開啟以便確認,關閉此視窗或按 Ctrl+C 結束程式)');
 }
 
-main().catch(async (err) => {
-  console.error('\n💥 程式發生未預期的錯誤:', err.message);
-  await pauseBeforeExit();
-});
+if (require.main === module) {
+  main().catch(async (err) => {
+    console.error('\n💥 程式發生未預期的錯誤:', err.message);
+    await pauseBeforeExit();
+  });
+}
+
+// 供測試腳本 require 使用(直接執行時不受影響)
+module.exports = {
+  measureServerTimeOffset,
+  parseOrderTime,
+  armInstantBuyClickerNow,
+  snipeMany,
+  blockHeavyResources,
+  openSecondWindow,
+  nextReloadDelay,
+  CONFIG,
+};

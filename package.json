@@ -1,6 +1,6 @@
 {
-  "name": "momo-sniper",
-  "version": "1.0.0",
+  "name": "momo",
+  "version": "1.0.1",
   "private": true,
   "description": "momo 定時搶購小幫手(Puppeteer,使用系統 Chrome)",
   "main": "auto-order.js",
@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node auto-order.js",
     "build": "pkg . --compress GZip --no-bytecode --public --public-packages '*' && npm run zip",
-    "zip": "cd dist && zip -X momo-sniper-mac-apple晶片.zip momo-sniper-macos-arm64 && zip -X momo-sniper-win.zip momo-sniper-win-x64.exe && rm -f momo-sniper-macos-arm64 momo-sniper-win-x64.exe"
+    "zip": "cd dist && zip -X momo-mac-v$npm_package_version.zip momo-macos-arm64 && zip -X momo-win-v$npm_package_version.zip momo-win-x64.exe && rm -f momo-macos-arm64 momo-win-x64.exe"
   },
   "pkg": {
     "targets": [
